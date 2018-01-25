@@ -4,6 +4,69 @@ import numpy as np
 from qcodes import VisaInstrument
 from qcodes.instrument.parameter import ArrayParameter
 from qcodes.utils.validators import Numbers, Ints, Enum, Strings
+from qcodes.instrument.channel import InstrumentChannel, ChannelList
+
+
+class SR830AuxChannel(InstrumentChannel):
+    """
+    Auxiliary channel for the SR830
+
+    Args:
+        parent (SR830)
+        name (string)
+        aux_number (int)
+    """
+    def __init__(self, parent: 'SR830', name: str, aux_number: int) ->None:
+        super().__init__(parent, name)
+
+        self.add_parameter('aux_in',
+                           label='Aux input {}'.format(aux_number),
+                           get_cmd='OAUX? {}'.format(aux_number),
+                           get_parser=float,
+                           unit='V')
+
+        self.add_parameter('aux_out',
+                           label='Aux output {}'.format(aux_number),
+                           get_cmd='AUXV? {}'.format(aux_number),
+                           get_parser=float,
+                           set_cmd='AUXV {0}, {{}}'.format(aux_number),
+                           unit='V')
+
+
+class SR830Channel(InstrumentChannel):
+    """
+    SR830 channel
+
+    Args:
+        parent (SR830)
+        name (string)
+        channel_number (int)
+    """
+    def __init__(self, parent: 'SR830', name: str, channel_number: int) ->None:
+        super().__init__(parent, name)
+        # detailed validation and mapping performed in set/get functions. Note that we only have
+        # two channels
+        self.add_parameter(
+            'ratio',
+            label='Channel {} ratio'.format(channel_number),
+            get_cmd=partial(parent._get_ch_ratio, channel_number),
+            set_cmd=partial(parent._set_ch_ratio, channel_number),
+            vals=Strings()
+        )
+
+        self.add_parameter(
+            'display',
+            label='Channel {} display'.format(channel_number),
+            get_cmd=partial(parent._get_ch_display, channel_number),
+            set_cmd=partial(parent._set_ch_display, channel_number),
+            vals=Strings()
+        )
+
+        self.add_parameter(
+            'databuffer',
+            channel_number=channel_number,
+            parameter_class=ChannelBuffer
+        )
 
 
 class ChannelBuffer(ArrayParameter):
@@ -15,23 +78,23 @@ class ChannelBuffer(ArrayParameter):
     The instrument natively supports this in its TRCL call.
     """
 
-    def __init__(self, name: str, instrument: 'SR830', channel: int):
+    def __init__(self, name: str, instrument: 'SR830Channel', channel_number: int) ->None:
         """
         Args:
             name (str): The name of the parameter
-            instrument (SR830): The parent instrument
+            channel_array (SR830Channel): The channel array of the parent instrument
             channel (int): The relevant channel (1 or 2). The name should
                 should match this.
         """
         self._valid_channels = (1, 2)
 
-        if channel not in self._valid_channels:
+        if channel_number not in self._valid_channels:
             raise ValueError('Invalid channel specifier. SR830 only has '
                              'channels 1 and 2.')
 
-        if not isinstance(instrument, SR830):
+        if not isinstance(instrument, SR830Channel):
             raise ValueError('Invalid parent instrument. ChannelBuffer '
-                             'can only live on an SR830.')
+                             'can only live on a channel buffer of SR830.')
 
         super().__init__(name,
                          shape=(1,),  # dummy initial shape
@@ -42,14 +105,16 @@ class ChannelBuffer(ArrayParameter):
                          docstring='Holds an acquired (part of the) '
                                    'data buffer of one channel.')
 
-        self.channel = channel
-        self._instrument = instrument
+        self._channel_number = channel_number
+        self._instrument = instrument.parent
+        self._channel = None  # This is set by the time we call "prepare_buffer_readout"
 
-    def prepare_buffer_readout(self):
+    def prepare_buffer_readout(self) ->None:
         """
         Function to generate the setpoints for the channel buffer and
         get the right units
         """
+        self._channel = self._instrument.channels[self._channel_number]
 
         N = self._instrument.buffer_npts()  # problem if this is zero?
         # TODO (WilliamHPNielsen): what if SR was changed during acquisition?
@@ -68,27 +133,26 @@ class ChannelBuffer(ArrayParameter):
 
         self.shape = (N,)
 
-        params = self._instrument.parameters
         # YES, it should be: "is not 'none'" NOT "is not None"
-        if params['ch{}_ratio'.format(self.channel)].get() is not 'none':
+        if self._channel.ratio() is not 'none':
             self.unit = '%'
         else:
-            disp = params['ch{}_display'.format(self.channel)].get()
+            disp = self._channel.display()
             if disp == 'Phase':
                 self.unit = 'deg'
             else:
                 self.unit = 'V'
 
-        if self.channel == 1:
+        if self._channel_number == 1:
             self._instrument._buffer1_ready = True
         else:
             self._instrument._buffer2_ready = True
 
-    def get(self):
+    def get(self) ->np.ndarray:
         """
         Get command. Returns numpy array
         """
-        if self.channel == 1:
+        if self._channel_number == 1:
             ready = self._instrument._buffer1_ready
         else:
             ready = self._instrument._buffer2_ready
@@ -102,7 +166,7 @@ class ChannelBuffer(ArrayParameter):
                              ' Can not poll anything.')
 
         # poll raw binary data
-        self._instrument.write('TRCL ? {}, 0, {}'.format(self.channel, N))
+        self._instrument.write('TRCL ? {}, 0, {}'.format(self._channel_number, N))
         rawdata = self._instrument.visa_handle.read_raw()
 
         # parse it
@@ -117,6 +181,10 @@ class SR830(VisaInstrument):
     """
     This is the qcodes driver for the Stanford Research Systems SR830
     Lock-in Amplifier
+
+    Args:
+        name (str)
+        address (str): A VISA address (e.g. GPIB::1::INSTR)
     """
 
     _VOLT_TO_N = {2e-9:    0, 5e-9:    1, 10e-9:  2,
@@ -153,11 +221,7 @@ class SR830(VisaInstrument):
 
     _N_TO_INPUT_CONFIG = {v: k for k, v in _INPUT_CONFIG_TO_N.items()}
 
-    def __init__(self, name, address, **kwargs):
-
-        RuntimeWarning("This is an old driver an will be removed. Please use the the new driver: "
-                       "\"SR830_channels\"")
-
+    def __init__(self, name: str, address: str, **kwargs: None) ->None:
         super().__init__(name, address, **kwargs)
 
         # Reference and phase
@@ -327,48 +391,23 @@ class SR830(VisaInstrument):
                            get_cmd='OEXP? 3',
                            get_parser=parse_offset_get)
 
+        aux = ChannelList(self, "Aux", SR830AuxChannel, snapshotable=False)
+        channels = ChannelList(self, "Channel", SR830Channel, snapshotable=False)
+
         # Aux input/output
-        for i in [1, 2, 3, 4]:
-            self.add_parameter('aux_in{}'.format(i),
-                               label='Aux input {}'.format(i),
-                               get_cmd='OAUX? {}'.format(i),
-                               get_parser=float,
-                               unit='V')
+        for count in [1, 2, 3, 4]:
+            iaux = SR830AuxChannel(self, "aux{}".format(count), count)
+            aux.append(iaux)
 
-            self.add_parameter('aux_out{}'.format(i),
-                               label='Aux output {}'.format(i),
-                               get_cmd='AUXV? {}'.format(i),
-                               get_parser=float,
-                               set_cmd='AUXV {0}, {{}}'.format(i),
-                               unit='V')
+            if count < 3:
+                channel = SR830Channel(self, "channel{}".format(count), count)
+                channels.append(channel)
+                self.add_submodule("ch{}".format(count), channel)
 
-        # Setup
-        self.add_parameter('output_interface',
-                           label='Output interface',
-                           get_cmd='OUTX?',
-                           set_cmd='OUTX {}',
-                           val_mapping={
-                               'RS232': '0\n',
-                               'GPIB': '1\n',
-                           })
-
-        # Channel setup
-        for ch in range(1, 3):
-
-            # detailed validation and mapping performed in set/get functions
-            self.add_parameter('ch{}_ratio'.format(ch),
-                               label='Channel {} ratio'.format(ch),
-                               get_cmd=partial(self._get_ch_ratio, ch),
-                               set_cmd=partial(self._set_ch_ratio, ch),
-                               vals=Strings())
-            self.add_parameter('ch{}_display'.format(ch),
-                               label='Channel {} display'.format(ch),
-                               get_cmd=partial(self._get_ch_display, ch),
-                               set_cmd=partial(self._set_ch_display, ch),
-                               vals=Strings())
-            self.add_parameter('ch{}_databuffer'.format(ch),
-                               channel=ch,
-                               parameter_class=ChannelBuffer)
+        aux.lock()
+        channels.lock()
+        self.add_submodule('channels', channels)
+        self.add_submodule('aux', aux)
 
         # Data transfer
         self.add_parameter('X',
@@ -544,41 +583,45 @@ class SR830(VisaInstrument):
         self.write('DDEF {}, {}, {}'.format(channel, disp, ratio_val))
         self._buffer_ready = False
 
-    def _set_units(self, unit):
+    def _set_units(self, unit: str) ->None:
         # TODO:
         # make a public parameter function that allows to change the units
         for param in [self.X, self.Y, self.R, self.sensitivity]:
             param.unit = unit
 
-    def _get_input_config(self, s):
+    def _get_input_config(self, s: str) ->int:
+        """
+        Args:
+            s (str): string representative of an integer
+        """
         mode = self._N_TO_INPUT_CONFIG[int(s)]
 
         if mode in ['a', 'a-b']:
-            self.sensitivity.vals = self._VOLT_ENUM
+            self.sensitivity.set_validator(self._VOLT_ENUM)
             self._set_units('V')
         else:
-            self.sensitivity.vals = self._CURR_ENUM
+            self.sensitivity.set_validator(self._CURR_ENUM)
             self._set_units('A')
 
         return mode
 
-    def _set_input_config(self, s):
+    def _set_input_config(self, s: str) ->int:
         if s in ['a', 'a-b']:
-            self.sensitivity.vals = self._VOLT_ENUM
+            self.sensitivity.set_validator(self._VOLT_ENUM)
             self._set_units('V')
         else:
-            self.sensitivity.vals = self._CURR_ENUM
+            self.sensitivity.set_validator(self._CURR_ENUM)
             self._set_units('A')
 
         return self._INPUT_CONFIG_TO_N[s]
 
-    def _get_sensitivity(self, s):
+    def _get_sensitivity(self, s: int) ->float:
         if self.input_config() in ['a', 'a-b']:
             return self._N_TO_VOLT[int(s)]
         else:
             return self._N_TO_CURR[int(s)]
 
-    def _set_sensitivity(self, s):
+    def _set_sensitivity(self, s: float) ->int:
         if self.input_config() in ['a', 'a-b']:
             return self._VOLT_TO_N[s]
         else:
