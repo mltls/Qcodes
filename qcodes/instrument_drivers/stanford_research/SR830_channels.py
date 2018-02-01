@@ -166,9 +166,7 @@ class ChannelBuffer(ArrayParameter):
                              ' Can not poll anything.')
 
         # poll raw binary data
-        self._instrument.write('TRCL ? {}, 0, {}'.format(self._channel_number, N))
-        rawdata = self._instrument.visa_handle.read_raw()
-
+        rawdata = self._instrument.ask_raw('TRCL ? {}, 0, {}'.format(self._channel_number, N))
         # parse it
         realdata = np.fromstring(rawdata, dtype='<i2')
         numbers = realdata[::2]*2.0**(realdata[1::2]-124)
